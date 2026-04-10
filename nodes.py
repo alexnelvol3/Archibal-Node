@@ -212,6 +212,14 @@ class ArchibalCallback:
             },
             "optional": {
                 "project_id": ("INT", {"default": 0}),
+                "webhook_url": (
+                    "STRING",
+                    {
+                        "default": "https://api.archibal.ai/api/comfy/callback",
+                        "multiline": False,
+                    },
+                ),
+                "include_references": ("BOOLEAN", {"default": True}),
                 "shot_label": (
                     "STRING",
                     {
@@ -224,14 +232,6 @@ class ArchibalCallback:
                         ),
                     },
                 ),
-                "webhook_url": (
-                    "STRING",
-                    {
-                        "default": "https://api.archibal.ai/api/comfy/callback",
-                        "multiline": False,
-                    },
-                ),
-                "include_references": ("BOOLEAN", {"default": True}),
             },
             "hidden": {
                 "prompt": "PROMPT",

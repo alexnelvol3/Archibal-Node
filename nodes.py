@@ -213,6 +213,7 @@ class ArchibalCallback:
                     },
                 ),
                 "include_references": ("BOOLEAN", {"default": True}),
+                "shot_label": ("STRING", {"default": "", "multiline": False}),
             },
             "hidden": {
                 "prompt": "PROMPT",
@@ -227,6 +228,7 @@ class ArchibalCallback:
         project_id=0,
         webhook_url="https://api.archibal.ai/api/comfy/callback",
         include_references=True,
+        shot_label="",
         prompt=None,
         extra_pnginfo=None,
     ):
@@ -274,6 +276,9 @@ class ArchibalCallback:
 
         if project_id and project_id > 0:
             payload["project_id"] = project_id
+
+        if shot_label:
+            payload["shot_label"] = shot_label
 
         if final_media:
             payload["image_b64"] = final_media[0]["data"]

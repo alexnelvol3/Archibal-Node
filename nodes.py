@@ -7,6 +7,7 @@ Sends full workflow provenance to the Archibal platform:
   - All prompt/text values extracted from workflow nodes
   - All model/checkpoint names used
   - Full workflow JSON for backend parsing
+  - Optional shot_label to support multi-shot projects
 
 Server-side only. Works in standard UI, API mode, and Comfy Cloud.
 """
@@ -42,6 +43,7 @@ MODEL_NODES = {
 MODEL_FIELDS = frozenset({
     "ckpt_name", "lora_name", "control_net_name",
     "model_name", "vae_name", "clip_name", "unet_name",
+    "model",
 })
 
 PROMPT_FIELDS = frozenset({
@@ -114,16 +116,21 @@ def _extract_provenance(prompt: dict) -> dict:
                     "text": value.strip(),
                 })
 
-        if class_type in MODEL_NODES:
-            for field in MODEL_FIELDS:
-                val = inputs.get(field)
-                if isinstance(val, str) and val:
-                    models.append({
-                        "node_id": node_id,
-                        "node_type": class_type,
-                        "field": field,
-                        "name": val,
-                    })
+        seen_model_key = set()
+        for field in MODEL_FIELDS:
+            val = inputs.get(field)
+            if not isinstance(val, str) or not val.strip():
+                continue
+            dedup_key = f"{class_type}:{val}"
+            if dedup_key in seen_model_key:
+                continue
+            seen_model_key.add(dedup_key)
+            models.append({
+                "node_id": node_id,
+                "node_type": class_type,
+                "field": field,
+                "name": val.strip(),
+            })
 
         if class_type in LOADER_NODES:
             filename = inputs.get("image") or inputs.get("video") or inputs.get("file")
@@ -205,6 +212,18 @@ class ArchibalCallback:
             },
             "optional": {
                 "project_id": ("INT", {"default": 0}),
+                "shot_label": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": False,
+                        "tooltip": (
+                            "Optional label for this shot (e.g. 'Shot 01', 'Scene 3 - Wide'). "
+                            "Multiple ArchibalCallback nodes in the same project should each "
+                            "have a unique shot_label."
+                        ),
+                    },
+                ),
                 "webhook_url": (
                     "STRING",
                     {
@@ -213,7 +232,6 @@ class ArchibalCallback:
                     },
                 ),
                 "include_references": ("BOOLEAN", {"default": True}),
-                "shot_label": ("STRING", {"default": "", "multiline": False}),
             },
             "hidden": {
                 "prompt": "PROMPT",
@@ -226,9 +244,9 @@ class ArchibalCallback:
         image,
         api_key,
         project_id=0,
+        shot_label="",
         webhook_url="https://api.archibal.ai/api/comfy/callback",
         include_references=True,
-        shot_label="",
         prompt=None,
         extra_pnginfo=None,
     ):
@@ -277,8 +295,8 @@ class ArchibalCallback:
         if project_id and project_id > 0:
             payload["project_id"] = project_id
 
-        if shot_label:
-            payload["shot_label"] = shot_label
+        if shot_label and shot_label.strip():
+            payload["shot_label"] = shot_label.strip()
 
         if final_media:
             payload["image_b64"] = final_media[0]["data"]
@@ -297,10 +315,11 @@ class ArchibalCallback:
                     data = resp.json()
                     logger.info(
                         f"Archibal: project={data.get('project_id')} | "
+                        f"shot={data.get('shot_label')!r} | "
                         f"models={data.get('models_found')} | "
                         f"risk={data.get('risk_level')} | "
-                        f"refs={len(reference_media)} | "
-                        f"prompts={len(provenance['prompts'])}"
+                        f"refs={data.get('references_stored', 0)} | "
+                        f"replaced={data.get('replaced_asset')}"
                     )
                 else:
                     logger.warning(f"Archibal: HTTP {resp.status_code}: {resp.text[:200]}")

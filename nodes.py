@@ -98,12 +98,41 @@ def _load_file_as_b64(filepath: str) -> Optional[str]:
         return None
 
 
-def _extract_provenance(prompt: dict) -> dict:
+def _collect_ancestors(prompt: dict, start_node_id) -> set:
+    """Return the set of node IDs reachable by walking input connections
+    backwards from start_node_id (inclusive)."""
+    ancestors: set = set()
+    if start_node_id is None:
+        return ancestors
+    start = str(start_node_id)
+    if start not in prompt:
+        return ancestors
+    stack = [start]
+    while stack:
+        nid = stack.pop()
+        if nid in ancestors:
+            continue
+        ancestors.add(nid)
+        node = prompt.get(nid)
+        if not node:
+            continue
+        for value in node.get("inputs", {}).values():
+            # ComfyUI represents connections as [node_id, output_index]
+            if isinstance(value, list) and len(value) == 2 and isinstance(value[0], (str, int)):
+                upstream = str(value[0])
+                if upstream in prompt and upstream not in ancestors:
+                    stack.append(upstream)
+    return ancestors
+
+
+def _extract_provenance(prompt: dict, node_ids: Optional[set] = None) -> dict:
     prompts = []
     models = []
     reference_files = []
 
     for node_id, node in prompt.items():
+        if node_ids is not None and node_id not in node_ids:
+            continue
         class_type = node.get("class_type", "")
         inputs = node.get("inputs", {})
 
@@ -236,6 +265,7 @@ class ArchibalCallback:
             "hidden": {
                 "prompt": "PROMPT",
                 "extra_pnginfo": "EXTRA_PNGINFO",
+                "unique_id": "UNIQUE_ID",
             },
         }
 
@@ -249,6 +279,7 @@ class ArchibalCallback:
         include_references=True,
         prompt=None,
         extra_pnginfo=None,
+        unique_id=None,
     ):
         if not api_key:
             logger.warning("Archibal: no API key, skipping")
@@ -275,9 +306,11 @@ class ArchibalCallback:
                     "role": "final_output",
                 })
 
-        provenance = _extract_provenance(prompt) if prompt else {
-            "prompts": [], "models": [], "reference_files": [],
-        }
+        if prompt:
+            ancestors = _collect_ancestors(prompt, unique_id)
+            provenance = _extract_provenance(prompt, ancestors)
+        else:
+            provenance = {"prompts": [], "models": [], "reference_files": []}
 
         reference_media = []
         if include_references and provenance["reference_files"]:

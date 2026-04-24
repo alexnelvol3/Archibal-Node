@@ -28,6 +28,11 @@ MAX_REFERENCE_BYTES = 10 * 1024 * 1024
 MAX_REFERENCE_ITEMS = 10
 MAX_BATCH_ITEMS = 20
 
+# Per-process cache: node_id -> {"data": <base64 png>, "shot_label": str}
+# Lets a downstream ArchibalCallback pull the output image of an upstream one
+# even though it's a tensor flowing through the graph, not a file on disk.
+_CALLBACK_IMAGE_CACHE: dict = {}
+
 LOADER_NODES_IMAGE = {"LoadImage", "LoadImageMask"}
 LOADER_NODES_VIDEO = {"VHS_LoadVideo", "LoadVideo"}
 LOADER_NODES = LOADER_NODES_IMAGE | LOADER_NODES_VIDEO
@@ -98,9 +103,11 @@ def _load_file_as_b64(filepath: str) -> Optional[str]:
         return None
 
 
-def _collect_ancestors(prompt: dict, start_node_id) -> set:
+def _collect_ancestors(prompt: dict, start_node_id, boundary_class: str = "ArchibalCallback") -> set:
     """Return the set of node IDs reachable by walking input connections
-    backwards from start_node_id (inclusive)."""
+    backwards from start_node_id (inclusive). Traversal stops at any upstream
+    node whose class_type matches boundary_class, so each ArchibalCallback only
+    captures the slice of the workflow since the previous one."""
     ancestors: set = set()
     if start_node_id is None:
         return ancestors
@@ -115,6 +122,8 @@ def _collect_ancestors(prompt: dict, start_node_id) -> set:
         ancestors.add(nid)
         node = prompt.get(nid)
         if not node:
+            continue
+        if nid != start and node.get("class_type") == boundary_class:
             continue
         for value in node.get("inputs", {}).values():
             # ComfyUI represents connections as [node_id, output_index]
@@ -306,6 +315,13 @@ class ArchibalCallback:
                     "role": "final_output",
                 })
 
+        if final_media and unique_id is not None:
+            _CALLBACK_IMAGE_CACHE[str(unique_id)] = {
+                "data": final_media[0]["data"],
+                "shot_label": shot_label.strip() if shot_label else "",
+            }
+
+        ancestors: set = set()
         if prompt:
             ancestors = _collect_ancestors(prompt, unique_id)
             provenance = _extract_provenance(prompt, ancestors)
@@ -316,6 +332,32 @@ class ArchibalCallback:
         if include_references and provenance["reference_files"]:
             input_dir = _get_input_directory()
             reference_media = _encode_references(provenance["reference_files"], input_dir)
+
+        prior_archibal = []
+        if include_references and prompt and unique_id is not None:
+            self_id = str(unique_id)
+            for nid in ancestors:
+                if nid == self_id:
+                    continue
+                node = prompt.get(nid) or {}
+                if node.get("class_type") != "ArchibalCallback":
+                    continue
+                cached = _CALLBACK_IMAGE_CACHE.get(nid)
+                entry = {
+                    "node_id": nid,
+                    "shot_label": cached.get("shot_label", "") if cached else "",
+                }
+                prior_archibal.append(entry)
+                if cached and len(reference_media) < MAX_REFERENCE_ITEMS:
+                    reference_media.append({
+                        "type": "image",
+                        "format": "png",
+                        "data": cached["data"],
+                        "node_id": nid,
+                        "node_type": "ArchibalCallback",
+                        "role": "prior_archibal_output",
+                        "shot_label": cached.get("shot_label", ""),
+                    })
 
         payload = {
             "workflow_json": prompt or {},
@@ -330,6 +372,9 @@ class ArchibalCallback:
 
         if shot_label and shot_label.strip():
             payload["shot_label"] = shot_label.strip()
+
+        if prior_archibal:
+            payload["prior_archibal"] = prior_archibal
 
         if final_media:
             payload["image_b64"] = final_media[0]["data"]

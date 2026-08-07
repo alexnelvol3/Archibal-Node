@@ -2,7 +2,7 @@
 Archibal Callback Node for ComfyUI
 -----------------------------------
 Sends full workflow provenance to the Archibal platform:
-  - Final output (image batch or video file), base64-encoded
+  - Final output (image batch, native VIDEO, and/or VHS_FILENAMES video), base64-encoded
   - All reference media found in the workflow, base64-encoded
   - All prompt/text values extracted from workflow nodes
   - All model/checkpoint names used
@@ -16,6 +16,7 @@ import base64
 import io
 import logging
 import os
+import tempfile
 from typing import Optional
 
 import httpx
@@ -27,6 +28,9 @@ logger = logging.getLogger(__name__)
 MAX_REFERENCE_BYTES = 10 * 1024 * 1024
 MAX_REFERENCE_ITEMS = 10
 MAX_BATCH_ITEMS = 20
+MAX_VIDEO_BYTES = 100 * 1024 * 1024
+
+VIDEO_EXTENSIONS = frozenset({".mp4", ".mov", ".webm", ".avi", ".mkv"})
 
 # Per-process cache: node_id -> {"data": <base64 png>, "shot_label": str}
 # Lets a downstream ArchibalCallback pull the output image of an upstream one
@@ -100,6 +104,97 @@ def _load_file_as_b64(filepath: str) -> Optional[str]:
             return base64.b64encode(f.read()).decode("utf-8")
     except Exception as e:
         logger.warning(f"Archibal: could not read {filepath}: {e}")
+        return None
+
+
+def _video_file_to_b64(filepath: str) -> Optional[dict]:
+    """Encode a video file on disk as a final_media payload entry."""
+    try:
+        if not os.path.isfile(filepath):
+            logger.warning(f"Archibal: video file not found: {filepath}")
+            return None
+        ext = os.path.splitext(filepath)[1].lower()
+        if ext not in VIDEO_EXTENSIONS:
+            logger.warning(f"Archibal: unsupported video type {ext}, skipping {filepath}")
+            return None
+        size = os.path.getsize(filepath)
+        if size > MAX_VIDEO_BYTES:
+            logger.warning(
+                f"Archibal: skipping video {filepath} "
+                f"({size / 1024 / 1024:.1f} MB exceeds {MAX_VIDEO_BYTES / 1024 / 1024:.0f} MB limit)"
+            )
+            return None
+        with open(filepath, "rb") as f:
+            data = base64.b64encode(f.read()).decode("utf-8")
+        return {
+            "type": "video",
+            "format": ext.lstrip("."),
+            "data": data,
+            "filename": os.path.basename(filepath),
+            "role": "final_output",
+        }
+    except Exception as e:
+        logger.warning(f"Archibal: could not read video {filepath}: {e}")
+        return None
+
+
+def _get_temp_directory() -> str:
+    try:
+        import folder_paths
+        return folder_paths.get_temp_directory()
+    except Exception:
+        return tempfile.gettempdir()
+
+
+def _encode_native_video(video) -> Optional[dict]:
+    """Encode a ComfyUI native VIDEO input (VideoInput API). Tries the source
+    file path first; falls back to save_to() into a temp file."""
+    try:
+        # VideoFromFile keeps the original path in __file (name-mangled);
+        # check the common public-ish spots without depending on any one API.
+        for attr in ("_VideoFromFile__file", "file", "path"):
+            src = getattr(video, attr, None)
+            if isinstance(src, str) and os.path.isfile(src):
+                return _video_file_to_b64(src)
+
+        tmp_dir = _get_temp_directory()
+        os.makedirs(tmp_dir, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(suffix=".mp4", dir=tmp_dir)
+        os.close(fd)
+        try:
+            video.save_to(tmp_path)
+            return _video_file_to_b64(tmp_path)
+        finally:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+    except Exception as e:
+        logger.warning(f"Archibal: could not encode VIDEO input: {e}")
+        return None
+
+
+def _encode_vhs_video(vhs_filenames) -> Optional[dict]:
+    """Encode the final video from a VHS_FILENAMES value: (save_output, [paths...]).
+    The last entry with a video extension is the muxed output."""
+    try:
+        paths = None
+        if isinstance(vhs_filenames, (tuple, list)) and len(vhs_filenames) == 2:
+            paths = vhs_filenames[1]
+        elif isinstance(vhs_filenames, (tuple, list)):
+            paths = vhs_filenames
+        if not paths:
+            logger.warning(f"Archibal: unexpected VHS_FILENAMES value: {vhs_filenames!r}")
+            return None
+        for candidate in reversed(list(paths)):
+            if not isinstance(candidate, str):
+                continue
+            if os.path.splitext(candidate)[1].lower() in VIDEO_EXTENSIONS:
+                return _video_file_to_b64(candidate)
+        logger.warning("Archibal: no video file found in VHS_FILENAMES")
+        return None
+    except Exception as e:
+        logger.warning(f"Archibal: could not encode VHS video: {e}")
         return None
 
 
@@ -236,8 +331,8 @@ def _encode_references(reference_files: list, input_dir: Optional[str]) -> list:
 
 class ArchibalCallback:
     CATEGORY = "Archibal"
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("image",)
+    RETURN_TYPES = ("IMAGE", "VIDEO")
+    RETURN_NAMES = ("image", "video")
     FUNCTION = "run"
     OUTPUT_NODE = True
 
@@ -245,10 +340,12 @@ class ArchibalCallback:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "image": ("IMAGE",),
                 "api_key": ("STRING", {"default": "", "multiline": False}),
             },
             "optional": {
+                "image": ("IMAGE",),
+                "video": ("VIDEO",),
+                "vhs_filenames": ("VHS_FILENAMES",),
                 "project_id": ("INT", {"default": 0}),
                 "webhook_url": (
                     "STRING",
@@ -280,8 +377,10 @@ class ArchibalCallback:
 
     def run(
         self,
-        image,
         api_key,
+        image=None,
+        video=None,
+        vhs_filenames=None,
         project_id=0,
         shot_label="",
         webhook_url="https://api.archibal.ai/api/comfy/callback",
@@ -292,32 +391,54 @@ class ArchibalCallback:
     ):
         if not api_key:
             logger.warning("Archibal: no API key, skipping")
-            return (image,)
+            return (image, video)
 
         if not webhook_url:
             logger.warning("Archibal: no webhook URL, skipping")
-            return (image,)
+            return (image, video)
 
-        if not hasattr(image, "shape") or len(image.shape) < 3:
-            logger.warning("Archibal: unexpected image tensor shape %r", getattr(image, "shape", None))
-            return (image,)
+        if image is None and video is None and vhs_filenames is None:
+            logger.warning("Archibal: no image or video connected, skipping")
+            return (image, video)
 
         final_media = []
-        batch_size = min(image.shape[0], MAX_BATCH_ITEMS)
-        for i in range(batch_size):
-            b64 = _tensor_to_b64_png(image[i])
-            if b64:
-                final_media.append({
-                    "type": "image",
-                    "format": "png",
-                    "data": b64,
-                    "index": i,
-                    "role": "final_output",
-                })
+        first_image_b64 = None
 
-        if final_media and unique_id is not None:
+        if image is not None:
+            if not hasattr(image, "shape") or len(image.shape) < 3:
+                logger.warning(
+                    "Archibal: unexpected image tensor shape %r", getattr(image, "shape", None)
+                )
+            else:
+                batch_size = min(image.shape[0], MAX_BATCH_ITEMS)
+                for i in range(batch_size):
+                    b64 = _tensor_to_b64_png(image[i])
+                    if b64:
+                        final_media.append({
+                            "type": "image",
+                            "format": "png",
+                            "data": b64,
+                            "index": i,
+                            "role": "final_output",
+                        })
+                if final_media:
+                    first_image_b64 = final_media[0]["data"]
+
+        video_entry = None
+        if video is not None:
+            video_entry = _encode_native_video(video)
+        if video_entry is None and vhs_filenames is not None:
+            video_entry = _encode_vhs_video(vhs_filenames)
+        if video_entry:
+            final_media.append(video_entry)
+
+        if not final_media:
+            logger.warning("Archibal: nothing could be encoded, skipping")
+            return (image, video)
+
+        if first_image_b64 and unique_id is not None:
             _CALLBACK_IMAGE_CACHE[str(unique_id)] = {
-                "data": final_media[0]["data"],
+                "data": first_image_b64,
                 "shot_label": shot_label.strip() if shot_label else "",
             }
 
@@ -376,8 +497,8 @@ class ArchibalCallback:
         if prior_archibal:
             payload["prior_archibal"] = prior_archibal
 
-        if final_media:
-            payload["image_b64"] = final_media[0]["data"]
+        if first_image_b64:
+            payload["image_b64"] = first_image_b64
 
         if extra_pnginfo:
             payload["extra_pnginfo"] = extra_pnginfo
@@ -404,7 +525,7 @@ class ArchibalCallback:
         except Exception as e:
             logger.error(f"Archibal: callback failed: {e}")
 
-        return (image,)
+        return (image, video)
 
 
 NODE_CLASS_MAPPINGS = {

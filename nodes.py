@@ -61,7 +61,7 @@ PROMPT_FIELDS = frozenset({
 })
 
 ALLOWED_EXTENSIONS = frozenset({
-    ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff",
+    ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".exr",
     ".mp4", ".mov", ".webm", ".avi", ".mkv",
 })
 

@@ -9,6 +9,12 @@ Sends full workflow provenance to the Archibal platform:
   - Full workflow JSON for backend parsing
   - Optional shot_label to support multi-shot projects
 
+Authentication, two modes:
+  - Paste the webhook URL from your Archibal Capture page into webhook_url and
+    leave api_key empty (the token in the URL authenticates the request).
+  - Or keep the legacy DEFAULT_WEBHOOK_URL and set api_key to a bearer key with
+    the comfy:write scope.
+
 Server-side only. Works in standard UI, API mode, and Comfy Cloud.
 """
 
@@ -29,6 +35,9 @@ MAX_REFERENCE_BYTES = 10 * 1024 * 1024
 MAX_REFERENCE_ITEMS = 10
 MAX_BATCH_ITEMS = 20
 MAX_VIDEO_BYTES = 100 * 1024 * 1024
+
+# Legacy route; requires api_key. Capture-page webhook URLs need no key.
+DEFAULT_WEBHOOK_URL = "https://archibal.ai/api/comfy/callback"
 
 VIDEO_EXTENSIONS = frozenset({".mp4", ".mov", ".webm", ".avi", ".mkv"})
 
@@ -340,7 +349,17 @@ class ArchibalCallback:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "api_key": ("STRING", {"default": "", "multiline": False}),
+                "api_key": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": False,
+                        "tooltip": (
+                            "Only needed for the legacy /api/comfy/callback route. "
+                            "Leave empty when using a webhook URL from the Capture page."
+                        ),
+                    },
+                ),
             },
             "optional": {
                 "image": ("IMAGE",),
@@ -350,8 +369,12 @@ class ArchibalCallback:
                 "webhook_url": (
                     "STRING",
                     {
-                        "default": "https://api.archibal.ai/api/comfy/callback",
+                        "default": DEFAULT_WEBHOOK_URL,
                         "multiline": False,
+                        "tooltip": (
+                            "Paste the webhook URL from your Archibal Capture page. "
+                            "Defaults to the legacy route, which requires api_key."
+                        ),
                     },
                 ),
                 "include_references": ("BOOLEAN", {"default": True}),
@@ -383,16 +406,12 @@ class ArchibalCallback:
         vhs_filenames=None,
         project_id=0,
         shot_label="",
-        webhook_url="https://api.archibal.ai/api/comfy/callback",
+        webhook_url=DEFAULT_WEBHOOK_URL,
         include_references=True,
         prompt=None,
         extra_pnginfo=None,
         unique_id=None,
     ):
-        if not api_key:
-            logger.warning("Archibal: no API key, skipping")
-            return (image, video)
-
         if not webhook_url:
             logger.warning("Archibal: no webhook URL, skipping")
             return (image, video)
@@ -503,13 +522,12 @@ class ArchibalCallback:
         if extra_pnginfo:
             payload["extra_pnginfo"] = extra_pnginfo
 
+        api_key = (api_key or "").strip()
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+
         try:
             with httpx.Client(timeout=60) as client:
-                resp = client.post(
-                    webhook_url,
-                    json=payload,
-                    headers={"Authorization": f"Bearer {api_key}"},
-                )
+                resp = client.post(webhook_url, json=payload, headers=headers)
                 if resp.status_code == 200:
                     data = resp.json()
                     logger.info(

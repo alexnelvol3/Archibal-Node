@@ -34,7 +34,10 @@ logger = logging.getLogger(__name__)
 MAX_REFERENCE_BYTES = 10 * 1024 * 1024
 MAX_REFERENCE_ITEMS = 10
 MAX_BATCH_ITEMS = 20
-MAX_VIDEO_BYTES = 100 * 1024 * 1024
+# 70 MB raw -> ~93 MB base64, keeps the JSON body under the 100 MB edge cap
+MAX_VIDEO_BYTES = 70 * 1024 * 1024
+# Edge allows 300 s for uploads
+HTTP_TIMEOUT = 300
 
 # Legacy route; requires api_key. Capture-page webhook URLs need no key.
 DEFAULT_WEBHOOK_URL = "https://archibal.ai/api/comfy/callback"
@@ -526,18 +529,26 @@ class ArchibalCallback:
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
         try:
-            with httpx.Client(timeout=60) as client:
+            with httpx.Client(timeout=HTTP_TIMEOUT) as client:
                 resp = client.post(webhook_url, json=payload, headers=headers)
                 if resp.status_code == 200:
                     data = resp.json()
-                    logger.info(
-                        f"Archibal: project={data.get('project_id')} | "
-                        f"shot={data.get('shot_label')!r} | "
-                        f"models={data.get('models_found')} | "
-                        f"risk={data.get('risk_level')} | "
-                        f"refs={data.get('references_stored', 0)} | "
-                        f"replaced={data.get('replaced_asset')}"
-                    )
+                    if "ingested" in data:  # capture-page webhook route
+                        logger.info(
+                            f"Archibal: project={data.get('project_id')} | "
+                            f"ingested={data.get('ingested')}/{data.get('received')} | "
+                            f"duplicates={data.get('duplicates')} | "
+                            f"assets={data.get('asset_ids')}"
+                        )
+                    else:  # legacy /api/comfy/callback
+                        logger.info(
+                            f"Archibal: project={data.get('project_id')} | "
+                            f"shot={data.get('shot_label')!r} | "
+                            f"models={data.get('models_found')} | "
+                            f"risk={data.get('risk_level')} | "
+                            f"refs={data.get('references_stored', 0)} | "
+                            f"replaced={data.get('replaced_asset')}"
+                        )
                 else:
                     logger.warning(f"Archibal: HTTP {resp.status_code}: {resp.text[:200]}")
         except Exception as e:

@@ -1,7 +1,7 @@
 [project]
 name = "archibal-node"
 description = "Sends ComfyUI workflow provenance (outputs, references, prompts, models) to Archibal."
-version = "1.2.0"
+version = "1.2.1"
 license = "MIT" 
 # classifiers = [
 #     # For OS-independent nodes (works on all operating systems)
